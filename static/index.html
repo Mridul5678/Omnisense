@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OmniSense Dashboard</title>
+    <!-- Linking CSS -->
+    <link rel="stylesheet" href="/static/style.css">
+    <!-- Font Awesome (Icons) -->
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
+    />
+  </head>
+  <body>
+    <div class="container">
+      <!-- HEADER -->
+      <header class="header">
+        <div class="logo-box">
+          <div class="logo-circle"><i class="fas fa-heartbeat"></i></div>
+          <span class="logo-text">OmniSense</span>
+        </div>
+
+        <!-- New Status Rectangles -->
+        <div class="stats-container">
+          <div class="stat-box active">
+            <span class="stat-label">Active Calls</span>
+            <span class="stat-number">24</span>
+          </div>
+          <div class="stat-box completed">
+            <span class="stat-label">Completed</span>
+            <span class="stat-number">00</span>
+          </div>
+          <div class="stat-box pending">
+            <span class="stat-label">Pending Calls</span>
+            <span class="stat-number">07</span>
+          </div>
+        </div>
+
+        <div id="live-clock" class="clock">00-00-0000 00:00:00</div>
+      </header>
+
+      <!-- MAIN LAYOUT -->
+      <div class="main-content">
+        <!-- LEFT AREA: CARDS (populated dynamically) -->
+        <div class="cards-grid"></div>
+
+        <!-- RIGHT AREA: SIDEBAR -->
+        <div class="sidebar">
+          <div class="video-placeholder"></div>
+          <div class="table-container">
+            <div class="col">
+              <h3>PRIORITY</h3>
+              <div id="priority-list"></div>
+            </div>
+            <div class="col">
+              <h3>DEPARTMENT</h3>
+              <div id="department-list"></div>
+            </div>
+            <div class="col">
+              <h3>STATUS</h3>
+              <div id="status-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Linking JavaScript -->
+    <script src="/static/dashboard.js"></script>
+  </body>
+</html>

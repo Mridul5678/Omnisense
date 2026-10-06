@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>OmniSense Operator</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { background: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; height: 100vh; margin: 0; }
+        .header { width: 100%; padding: 15px; background: #1f1f1f; text-align: center; font-weight: bold; border-bottom: 1px solid #333; }
+        
+        #login-box { margin-top: 100px; text-align: center; }
+        input { padding: 10px; border-radius: 5px; border: none; width: 200px; }
+        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        
+        /* LAYOUT: Split Screen */
+        #dashboard { display: none; width: 95%; max-width: 1000px; margin-top: 20px; display:flex; gap:20px; height: 80vh; }
+        
+        /* LEFT: Active Call Panel (60%) */
+        #active-call-panel { flex: 2; background: #2d2d2d; padding: 20px; border-radius: 10px; text-align: center; border: 1px solid #444; display: none; flex-direction: column; justify-content: center; }
+        .pulse { animation: pulse 1.5s infinite; color: #dc3545; font-size: 60px; margin: 30px 0; }
+        @keyframes pulse { 0% { transform: scale(0.95); opacity: 0.7; } 100% { transform: scale(1.1); opacity: 1; } }
+        .info-row { display: flex; justify-content: space-between; margin-bottom: 15px; border-bottom: 1px solid #444; padding-bottom: 10px; font-size: 1.1rem; }
+
+        /* RIGHT: Queue List (40%) */
+        #queue-panel { flex: 1; background: #1e1e1e; padding: 15px; border-radius: 10px; border: 1px solid #333; display:none; overflow-y: auto; }
+        .queue-item { background: #333; padding: 15px; margin-bottom: 10px; border-radius: 5px; border-left: 4px solid #ff9800; }
+        .q-header { display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 5px; }
+        .q-sev { color: #ff9800; font-size: 0.9rem; }
+        .q-sum { font-size: 0.85em; color: #aaa; margin-bottom: 10px; line-height: 1.4; }
+        .btn-pickup { width: 100%; padding: 10px; background: #4caf50; border: none; border-radius: 5px; color: white; cursor: pointer; font-weight: bold; text-transform: uppercase; }
+        .btn-pickup:hover { background: #45a049; }
+    </style>
+</head>
+<body>
+    <div class="header">OPERATOR PORTAL</div>
+
+    <div id="login-box">
+        <h3>Operator Login</h3>
+        <input type="text" id="op-id" placeholder="Enter ID (e.g. op1)">
+        <button onclick="joinPool()">Start Shift</button>
+    </div>
+
+    <div id="status" style="margin-top:20px; color:#aaa;">Offline</div>
+
+    <div id="dashboard">
+        
+        <div id="active-call-panel">
+            <div style="color:#dc3545; font-weight:bold; font-size: 1.2rem;">LIVE EMERGENCY</div>
+            <div class="pulse"><i class="fas fa-phone-volume"></i></div>
+            
+            <div class="info-row"><span>CALLER:</span> <span id="c-phone">--</span></div>
+            <div class="info-row"><span>LOCATION:</span> <span id="c-loc">--</span></div>
+            <div class="info-row"><span>SEVERITY:</span> <span id="c-sev" style="color:#ff9800;">--</span></div>
+            <div class="info-row"><span>SUMMARY:</span> <span id="c-sum" style="font-size:0.8em; text-align:right;">--</span></div>
+            
+            <div style="margin-top:20px; font-size:0.9rem; color:#888;">MICROPHONE ACTIVE • SPEAKING TO VICTIM</div>
+            <button onclick="endCall()" style="background:#dc3545; margin-top:15px; width:100%; padding:10px; border:none; color:white; border-radius:5px; cursor:pointer;">End Call</button>
+        </div>
+
+        <div id="queue-panel">
+            <h4 style="margin-top:0; border-bottom:1px solid #444; padding-bottom:10px;">Waiting Calls (AI Handling)</h4>
+            <div id="queue-list">
+                <div style="color:#666; font-style:italic;">No calls waiting...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        let audioContext;
+        
+        async function joinPool() {
+            const opId = document.getElementById('op-id').value;
+            if(!opId) return alert("Enter ID");
+            
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000 } });
+                setupAudio(stream);
+            } catch(e) {
+                return alert("Microphone access required! Please allow access.");
+            }
+
+            const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${protocol}://${window.location.host}/ws/operator/${opId}`);
+            
+            ws.onopen = () => {
+                document.getElementById('login-box').style.display = 'none';
+                document.getElementById('dashboard').style.display = 'flex';
+                document.getElementById('queue-panel').style.display = 'block';
+                document.getElementById('status').innerText = "✅ ONLINE - Waiting for calls...";
+                document.getElementById('status').style.color = "#00cc00";
+            };
+
+            ws.onmessage = async (event) => {
+                if (event.data instanceof Blob) {
+                    playAudio(await event.data.arrayBuffer());
+                } else {
+                    const data = JSON.parse(event.data);
+                    
+                    // --- HANDLE EVENTS ---
+                    if (data.type === 'new_assignment') {
+                        showCall(data);
+                    } else if (data.type === 'call_ended') {
+                        hideCall();
+                    } else if (data.type === 'queue_update') {
+                        renderQueue(data.calls);
+                    }
+                }
+            };
+        }
+
+        function renderQueue(calls) {
+            const list = document.getElementById('queue-list');
+            list.innerHTML = '';
+            
+            if(calls.length === 0) {
+                list.innerHTML = '<div style="color:#666; font-style:italic;">No calls waiting...</div>';
+                return;
+            }
+            
+            calls.forEach(call => {
+                const div = document.createElement('div');
+                div.className = 'queue-item';
+                div.innerHTML = `
+                    <div class="q-header">
+                        <span>${call.phone}</span>
+                        <span class="q-sev">${call.severity}</span>
+                    </div>
+                    <div class="q-sum">${call.summary}</div>
+                    <button class="btn-pickup" onclick="pickupCall('${call.id}')">Pick Up Call</button>
+                `;
+                list.appendChild(div);
+            });
+        }
+
+        function pickupCall(callId) {
+            // Send JSON Command to Server
+            ws.send(JSON.stringify({
+                type: 'pickup_call',
+                call_id: callId
+            }));
+        }
+
+        function showCall(data) {
+            document.getElementById('active-call-panel').style.display = 'flex';
+            // Disable queue interaction while on call
+            document.getElementById('queue-panel').style.opacity = '0.5';
+            document.getElementById('queue-panel').style.pointerEvents = 'none';
+            
+            document.getElementById('status').innerText = "⚠️ ON CALL";
+            document.getElementById('status').style.color = "#dc3545";
+            
+            document.getElementById('c-phone').innerText = data.caller_id;
+            document.getElementById('c-loc').innerText = data.location;
+            document.getElementById('c-sev').innerText = data.severity;
+            document.getElementById('c-sum').innerText = data.summary;
+        }
+
+        function hideCall() {
+            document.getElementById('active-call-panel').style.display = 'none';
+            document.getElementById('queue-panel').style.opacity = '1';
+            document.getElementById('queue-panel').style.pointerEvents = 'auto';
+            
+            document.getElementById('status').innerText = "✅ ONLINE - Waiting for calls...";
+            document.getElementById('status').style.color = "#00cc00";
+        }
+        
+        function endCall() {
+            // Send command to complete/end the call
+            ws.send(JSON.stringify({
+                type: 'complete_call'
+            }));
+            // Optimistically hide the UI (server will confirm with call_ended event)
+            hideCall();
+        }
+
+        function setupAudio(stream) {
+            audioContext = new AudioContext({ sampleRate: 16000 });
+            const source = audioContext.createMediaStreamSource(stream);
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+            
+            processor.onaudioprocess = (e) => {
+                if(ws && ws.readyState === WebSocket.OPEN) {
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const buffer = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        let s = Math.max(-1, Math.min(1, inputData[i]));
+                        buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+                    ws.send(buffer.buffer);
+                }
+            };
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+        }
+
+        function playAudio(arrayBuffer) {
+            const float32 = new Float32Array(arrayBuffer.byteLength / 2);
+            const dataView = new DataView(arrayBuffer);
+            for (let i = 0; i < float32.length; i++) {
+                float32[i] = dataView.getInt16(i * 2, true) / 32768.0;
+            }
+            const buffer = audioContext.createBuffer(1, float32.length, 16000);
+            buffer.getChannelData(0).set(float32);
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+            source.start();
+        }
+    </script>
+</body>
+</html>

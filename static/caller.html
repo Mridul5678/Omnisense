@@ -1,0 +1,254 @@
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmniSense Emergency</title>
+    <style>
+        body { background-color: #1a1a1a; color: white; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .pulse { animation: pulse-animation 2s infinite; }
+        @keyframes pulse-animation { 0% { box-shadow: 0 0 0 0px rgba(220, 53, 69, 0.5); } 100% { box-shadow: 0 0 0 30px rgba(220, 53, 69, 0); } }
+        
+        #transcript-box {
+            width: 90%; max-width: 400px; height: 300px; 
+            background: #2d2d2d; border-radius: 12px; 
+            overflow-y: auto; padding: 15px; margin-top: 20px;
+            display: flex; flex-direction: column; gap: 10px;
+        }
+        .msg { padding: 10px; border-radius: 10px; max-width: 80%; }
+        .ai { background: #0056b3; align-self: flex-start; border-bottom-left-radius: 2px; }
+        .user { background: #444; align-self: flex-end; border-bottom-right-radius: 2px; text-align: right;}
+        
+        .btn-sos {
+            width: 150px; height: 150px; border-radius: 50%;
+            background: #dc3545; border: none; color: white;
+            font-size: 24px; font-weight: bold; cursor: pointer;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            transition: transform 0.2s;
+        }
+        .btn-sos:active { transform: scale(0.95); }
+        .status { margin-top: 15px; color: #aaa; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+
+    <div id="start-view">
+        <button class="btn-sos pulse" onclick="startEmergencyCall()">SOS</button>
+        <p style="margin-top:20px; color:#888;">Tap to Call 911</p>
+    </div>
+
+    <div id="call-view" style="display:none; width:100%; display:flex; flex-direction:column; align-items:center;">
+        <div style="font-size:1.2rem; font-weight:bold; color:#dc3545;">LIVE CALL</div>
+        <div class="status" id="connection-status">Connecting...</div>
+        <div id="transcript-box"></div>
+        <button onclick="endCall()" id="end-call-btn" style="margin-top:20px; padding:10px 20px; background:#444; border:none; color:white; border-radius:5px;">End Call</button>
+    </div>
+
+    <script>
+        let ws;
+        let audioContext;
+        let workletNode;
+        let mediaStream;
+        let callEnded = false;
+        
+        // --- VAD (Voice Activity Detection) Processor ---
+        // buffers audio and only sends when user stops speaking
+        const processorCode = `
+            class VADProcessor extends AudioWorkletProcessor {
+                constructor() {
+                    super();
+                    this.buffer = []; 
+                    this.isSpeaking = false;
+                    this.silenceCounter = 0;
+                    
+                    // Config
+                    this.SAMPLE_RATE = 16000;
+                    this.SILENCE_THRESHOLD = 0.01; // Amplitude threshold
+                    this.SILENCE_DURATION = 0.8 * this.SAMPLE_RATE; // 0.8 seconds of silence to trigger send
+                    this.MAX_DURATION = 5.0 * this.SAMPLE_RATE; // Max 5 seconds before forced send
+                }
+
+                process(inputs, outputs, parameters) {
+                    const input = inputs[0];
+                    if (input.length > 0) {
+                        const channel0 = input[0];
+                        let sumSquares = 0;
+
+                        // 1. Convert to Int16 and calculate energy (RMS)
+                        const int16Data = new Int16Array(channel0.length);
+                        for (let i = 0; i < channel0.length; i++) {
+                            const s = Math.max(-1, Math.min(1, channel0[i]));
+                            int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                            sumSquares += s * s;
+                        }
+                        
+                        // 2. Add to buffer
+                        this.buffer.push(int16Data);
+
+                        // 3. VAD Logic
+                        const rms = Math.sqrt(sumSquares / channel0.length);
+                        
+                        if (rms > this.SILENCE_THRESHOLD) {
+                            this.isSpeaking = true;
+                            this.silenceCounter = 0;
+                        } else {
+                            if (this.isSpeaking) {
+                                this.silenceCounter += channel0.length;
+                            }
+                        }
+
+                        // 4. Trigger Send?
+                        const totalSamples = this.buffer.length * 128; // approx (128 samples per block)
+                        
+                        // Condition A: Silence detected after speech
+                        const silenceDetected = this.isSpeaking && (this.silenceCounter > this.SILENCE_DURATION);
+                        
+                        // Condition B: Buffer too full (force send)
+                        const forceSend = totalSamples > this.MAX_DURATION;
+
+                        if ((silenceDetected || forceSend) && this.buffer.length > 0) {
+                            this.flush();
+                        }
+                    }
+                    return true;
+                }
+
+                flush() {
+                    // Flatten buffer chunks into one Int16Array
+                    const totalLength = this.buffer.reduce((acc, val) => acc + val.length, 0);
+                    const result = new Int16Array(totalLength);
+                    let offset = 0;
+                    for (const chunk of this.buffer) {
+                        result.set(chunk, offset);
+                        offset += chunk.length;
+                    }
+
+                    // Send to main thread
+                    this.port.postMessage(result);
+                    
+                    // Reset
+                    this.buffer = [];
+                    this.isSpeaking = false;
+                    this.silenceCounter = 0;
+                }
+            }
+            registerProcessor('vad-processor', VADProcessor);
+        `;
+
+        async function startEmergencyCall() {
+            document.getElementById('start-view').style.display = 'none';
+            document.getElementById('call-view').style.display = 'flex';
+
+            const callId = "call_" + Math.floor(Math.random() * 10000);
+            const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${protocol}://${window.location.host}/ws/audio/${callId}`);
+            
+            ws.onopen = async () => {
+                document.getElementById('connection-status').innerText = "Connected - Speak Now";
+                await startAudioStream();
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'ai_speech') {
+                    addMessage('AI', data.text);
+                    speak(data.text);
+                } else if (data.type === 'transcription') {
+                    addMessage('You', data.text);
+                } else if (data.type === 'call_queued') {
+                    document.getElementById('connection-status').innerText = "PRIORITY QUEUE";
+                    document.getElementById('connection-status').style.color = "#ffc107";
+                    speak(data.message);
+                } else if (data.type === 'call_ended') {
+                    setCallEnded("Call ended by operator.");
+                }
+            };
+
+            ws.onclose = () => {
+                if (!callEnded) {
+                    setCallEnded("Call ended.");
+                }
+            };
+        }
+
+        async function startAudioStream() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        channelCount: 1, 
+                        sampleRate: 16000,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
+
+                audioContext = new AudioContext({ sampleRate: 16000 });
+                const source = audioContext.createMediaStreamSource(mediaStream);
+
+                const blob = new Blob([processorCode], { type: "application/javascript" });
+                const url = URL.createObjectURL(blob);
+                await audioContext.audioWorklet.addModule(url);
+
+                workletNode = new AudioWorkletNode(audioContext, 'vad-processor');
+                
+                workletNode.port.onmessage = (e) => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(e.data); // Sends full phrase buffer
+                    }
+                };
+
+                source.connect(workletNode);
+                // NOTE: NOT connecting to destination to prevent echo
+                
+            } catch (err) {
+                console.error("Mic Error:", err);
+                alert("Microphone access failed. Check permissions.");
+            }
+        }
+
+        function setCallEnded(message) {
+            callEnded = true;
+            document.getElementById('connection-status').innerText = message;
+            document.getElementById('connection-status').style.color = "#aaa";
+            const endButton = document.getElementById('end-call-btn');
+            endButton.innerText = "Restart";
+            endButton.onclick = () => location.reload();
+            stopAudio();
+        }
+
+        function stopAudio() {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            if (workletNode) {
+                workletNode.disconnect();
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+        }
+
+        function endCall() {
+            setCallEnded("Ending call...");
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+        }
+
+        function addMessage(sender, text) {
+            const box = document.getElementById('transcript-box');
+            const div = document.createElement('div');
+            div.className = `msg ${sender === 'AI' ? 'ai' : 'user'}`;
+            div.innerText = text;
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
+        }
+
+        function speak(text) {
+            const u = new SpeechSynthesisUtterance(text);
+            window.speechSynthesis.speak(u);
+        }
+    </script>
+</body>
+</html>
